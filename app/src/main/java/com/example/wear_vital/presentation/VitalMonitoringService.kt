@@ -14,9 +14,14 @@ import androidx.core.app.NotificationCompat
 import androidx.health.services.client.HealthServices
 import androidx.health.services.client.MeasureCallback
 import androidx.health.services.client.data.*
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import okhttp3.OkHttpClient
+import okhttp3.logging.HttpLoggingInterceptor
+import retrofit2.Retrofit
+import retrofit2.converter.gson.GsonGsonConverterFactory
 import java.util.Locale
 
 @androidx.compose.runtime.Immutable
@@ -26,7 +31,7 @@ data class HealthData(
     val steps: String = "--",
     val calories: String = "--",
     val distance: String = "--",
-    val status: String = "Waiting for data..."
+    val status: String = "Initializing..."
 )
 
 class VitalMonitoringService : Service() {
@@ -34,9 +39,12 @@ class VitalMonitoringService : Service() {
     private val tag = "VitalService"
     private val channelId = "VitalMonitoringChannel"
     private val notificationId = 1
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     private val healthClient by lazy { HealthServices.getClient(this) }
     private val measureClient by lazy { healthClient.measureClient }
+
+    private lateinit var vitalsApi: VitalsApi
 
     companion object {
         private val _healthDataFlow = MutableStateFlow(HealthData())
@@ -49,151 +57,159 @@ class VitalMonitoringService : Service() {
     private val callback = object : MeasureCallback {
         override fun onDataReceived(data: DataPointContainer) {
             var current = _healthDataFlow.value.copy(status = "Live")
+            var shouldSendApi = false
 
             // 1. Heart Rate
-            val hrData = data.getData(DataType.HEART_RATE_BPM)
-            if (hrData.isNotEmpty()) {
-                val lastPoint = hrData.last()
-                if (lastPoint is SampleDataPoint<Double>) {
-                    current = current.copy(heartRate = String.format(Locale.US, "%.0f", lastPoint.value))
+            data.getData(DataType.HEART_RATE_BPM).lastOrNull()?.let {
+                if (it is SampleDataPoint<Double>) {
+                    current = current.copy(heartRate = String.format(Locale.US, "%.0f", it.value))
+                    shouldSendApi = true
                 }
             }
 
-            // 2. SpO2 (VO2_MAX as proxy if OXYGEN_SATURATION is unresolved)
-            // Note: VO2_MAX is a SampleDataPoint<Double> in alpha04
-            val spo2Data = data.getData(DataType.VO2_MAX)
-            if (spo2Data.isNotEmpty()) {
-                val lastPoint = spo2Data.last()
-                if (lastPoint is SampleDataPoint<Double>) {
-                    current = current.copy(spo2 = String.format(Locale.US, "%.1f", lastPoint.value))
+            // 2. SpO2
+            data.getData(DataType.OXYGEN_SATURATION).lastOrNull()?.let {
+                if (it is SampleDataPoint<Double>) {
+                    current = current.copy(spo2 = String.format(Locale.US, "%.1f", it.value))
+                    shouldSendApi = true
                 }
             }
 
-            // 3. Daily Steps (IntervalDataPoint<Long>)
-            val stepData = data.getData(DataType.STEPS_DAILY)
-            if (stepData.isNotEmpty()) {
-                val lastPoint = stepData.last()
-                if (lastPoint is IntervalDataPoint<Long>) {
-                    current = current.copy(steps = lastPoint.value.toString())
+            // 3. Daily Steps
+            data.getData(DataType.STEPS_DAILY).lastOrNull()?.let {
+                if (it is IntervalDataPoint<Long>) {
+                    current = current.copy(steps = it.value.toString())
                 }
             }
 
-            // 4. Calories (IntervalDataPoint<Double>)
-            val calorieData = data.getData(DataType.CALORIES_DAILY)
-            if (calorieData.isNotEmpty()) {
-                val lastPoint = calorieData.last()
-                if (lastPoint is IntervalDataPoint<Double>) {
-                    current = current.copy(calories = String.format(Locale.US, "%.0f", lastPoint.value))
+            // 4. Daily Calories
+            data.getData(DataType.CALORIES_DAILY).lastOrNull()?.let {
+                if (it is IntervalDataPoint<Double>) {
+                    current = current.copy(calories = String.format(Locale.US, "%.0f", it.value))
                 }
             }
 
-            // 5. Distance (IntervalDataPoint<Double>)
-            val distanceData = data.getData(DataType.DISTANCE_DAILY)
-            if (distanceData.isNotEmpty()) {
-                val lastPoint = distanceData.last()
-                if (lastPoint is IntervalDataPoint<Double>) {
-                    current = current.copy(distance = String.format(Locale.US, "%.0f m", lastPoint.value))
+            // 5. Daily Distance
+            data.getData(DataType.DISTANCE_DAILY).lastOrNull()?.let {
+                if (it is IntervalDataPoint<Double>) {
+                    current = current.copy(distance = String.format(Locale.US, "%.0f m", it.value))
                 }
             }
 
             _healthDataFlow.value = current
-            Log.d(tag, "Data updated: $current")
+
+            if (shouldSendApi) {
+                sendVitalsToServer(current)
+            }
         }
 
         override fun onAvailabilityChanged(dataType: DeltaDataType<*, *>, availability: Availability) {
-            Log.d(tag, "Availability changed for ${dataType.name}: $availability")
+            Log.d(tag, "Availability: ${dataType.name} -> $availability")
         }
     }
 
     override fun onCreate() {
         super.onCreate()
         isServiceRunning = true
+        setupRetrofit()
         createNotificationChannel()
+    }
+
+    private fun setupRetrofit() {
+        val logging = HttpLoggingInterceptor().apply {
+            level = HttpLoggingInterceptor.Level.BODY
+        }
+        val client = OkHttpClient.Builder()
+            .addInterceptor(logging)
+            .build()
+
+        val retrofit = Retrofit.Builder()
+            .baseUrl("http://192.168.0.32/") // Your local server IP
+            .client(client)
+            .addConverterFactory(GsonGsonConverterFactory.create())
+            .build()
+
+        vitalsApi = retrofit.create(VitalsApi::class.java)
+    }
+
+    private fun sendVitalsToServer(data: HealthData) {
+        val hr = data.heartRate.toIntOrNull() ?: return
+        val spo2 = data.spo2.toDoubleOrNull() ?: 0.0
+        
+        serviceScope.launch {
+            try {
+                val request = VitalsRequest(
+                    heartRate = hr,
+                    bloodOxygen = spo2,
+                    trend = "flat"
+                )
+                val response = vitalsApi.sendVitals(request)
+                if (response.isSuccessful) {
+                    Log.i(tag, "API Success: Vitals Sent")
+                } else {
+                    Log.e(tag, "API Error: ${response.code()}")
+                }
+            } catch (e: Exception) {
+                Log.e(tag, "API Exception: ${e.message}")
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val notification = createNotification()
-        
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                startForeground(notificationId, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH)
-            } else {
-                startForeground(notificationId, notification)
-            }
-            startMonitoring()
-        } catch (e: Exception) {
-            Log.e(tag, "Failed to start foreground service", e)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(notificationId, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH)
+        } else {
+            startForeground(notificationId, notification)
         }
-
+        startMonitoring()
         return START_STICKY
     }
 
     private fun startMonitoring() {
-        val dataTypes = setOf(
+        val types = listOf(
             DataType.HEART_RATE_BPM,
-            DataType.VO2_MAX,
+            DataType.OXYGEN_SATURATION,
             DataType.STEPS_DAILY,
             DataType.CALORIES_DAILY,
             DataType.DISTANCE_DAILY
         )
-
-        dataTypes.forEach { dataType ->
-            try {
-                measureClient.registerMeasureCallback(dataType, callback)
-            } catch (e: Exception) {
-                Log.e(tag, "Failed to register ${dataType.name}", e)
-            }
-        }
+        types.forEach { measureClient.registerMeasureCallback(it, callback) }
     }
 
     private fun stopMonitoring() {
-        val dataTypes = setOf(
+        val types = listOf(
             DataType.HEART_RATE_BPM,
-            DataType.VO2_MAX,
+            DataType.OXYGEN_SATURATION,
             DataType.STEPS_DAILY,
             DataType.CALORIES_DAILY,
             DataType.DISTANCE_DAILY
         )
-
-        dataTypes.forEach { dataType ->
-            try {
-                measureClient.unregisterMeasureCallbackAsync(dataType, callback)
-            } catch (e: Exception) {
-                Log.e(tag, "Failed to unregister ${dataType.name}", e)
-            }
-        }
+        types.forEach { measureClient.unregisterMeasureCallbackAsync(it, callback) }
     }
 
     override fun onDestroy() {
         isServiceRunning = false
         stopMonitoring()
+        serviceScope.cancel()
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun createNotification(): Notification {
-        val builder = NotificationCompat.Builder(this, channelId)
+        return NotificationCompat.Builder(this, channelId)
             .setContentTitle("Vital Monitoring")
-            .setContentText("Monitoring health sensors in background")
+            .setContentText("Actively reading sensors & sending to server...")
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
             .setOngoing(true)
             .setCategory(Notification.CATEGORY_SERVICE)
-        
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            builder.setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-        }
-        
-        return builder.build()
+            .build()
     }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                channelId,
-                "Health Monitoring Service",
-                NotificationManager.IMPORTANCE_LOW
-            )
+            val channel = NotificationChannel(channelId, "Vitals", NotificationManager.IMPORTANCE_LOW)
             val manager = getSystemService(NotificationManager::class.java)
             manager?.createNotificationChannel(channel)
         }

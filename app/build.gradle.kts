@@ -50,11 +50,17 @@ dependencies {
     implementation(libs.activity.compose)
     implementation(libs.core.splashscreen)
     
-    // Health Services - Stable Version
+    // Health Services
     implementation(libs.androidx.health.services)
     implementation(libs.guava)
     implementation(libs.androidx.concurrent.futures.ktx)
     implementation(libs.kotlinx.coroutines.guava)
+
+    // Networking
+    implementation(libs.retrofit)
+    implementation(libs.retrofit.gson)
+    implementation(libs.okhttp)
+    implementation(libs.okhttp.logging)
 
     androidTestImplementation(platform(libs.compose.bom))
     androidTestImplementation(libs.ui.test.junit4)
